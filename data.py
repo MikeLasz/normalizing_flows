@@ -29,18 +29,35 @@ def load_dataset(name):
 # Dataloaders
 # --------------------
 
-def fetch_dataloaders(dataset_name, batch_size, device, flip_toy_var_order=False, toy_train_size=25000, toy_test_size=5000):
+def fetch_dataloaders(dataset_name, batch_size, device, heavy_tailed, flip_toy_var_order=False, toy_train_size=25000, toy_test_size=5000):
 
     # grab datasets
     if dataset_name in ['GAS', 'POWER', 'HEPMASS', 'MINIBOONE', 'BSDS300']:  # use the constructors by MAF authors
         dataset = load_dataset(dataset_name)()
 
-        # join train and val data again
-        train_data = np.concatenate((dataset.trn.x, dataset.val.x), axis=0)
+        # in mtaf: permutate the marginals according to their degree of freedom
+        if max(heavy_tailed): # one of the components is heavy tailed
+            permutation = np.argsort(np.array(heavy_tailed))
+            inv_perm = np.zeros(len(heavy_tailed), dtype=np.int32)  # for reordering
+            for j in range(len(heavy_tailed)):
+                inv_perm[permutation[j]] = j
 
-        # construct datasets
-        train_dataset = TensorDataset(torch.from_numpy(train_data.astype(np.float32)))
-        test_dataset  = TensorDataset(torch.from_numpy(dataset.tst.x.astype(np.float32)))
+            data_trn = dataset.trn.x[:, permutation]
+            data_val = dataset.val.x[:, permutation]
+            data_tst = dataset.tst.x[:, permutation]
+
+            # construct datasets
+            train_dataset = TensorDataset(torch.from_numpy(data_trn.astype(np.float32)))
+            val_dataset = TensorDataset(torch.from_numpy(data_val.astype(np.float32)))
+            test_dataset = TensorDataset(torch.from_numpy(data_tst.astype(np.float32)))
+        else:
+            permutation = np.arange(len(heavy_tailed))
+            inv_perm = permutation
+
+            # construct datasets
+            train_dataset = TensorDataset(torch.from_numpy(dataset.trn.x.astype(np.float32)))
+            val_dataset = TensorDataset(torch.from_numpy(dataset.val.x.astype(np.float32)))
+            test_dataset = TensorDataset(torch.from_numpy(dataset.tst.x.astype(np.float32)))
 
         input_dims = dataset.n_dims
         label_size = None
@@ -98,6 +115,11 @@ def fetch_dataloaders(dataset_name, batch_size, device, flip_toy_var_order=False
     train_dataset.label_size = label_size
     train_dataset.lam = lam
 
+    val_dataset.input_dims = input_dims
+    val_dataset.input_size = int(np.prod(input_dims))
+    val_dataset.label_size = label_size
+    val_dataset.lam = lam
+
     test_dataset.input_dims = input_dims
     test_dataset.input_size = int(np.prod(input_dims))
     test_dataset.label_size = label_size
@@ -107,6 +129,7 @@ def fetch_dataloaders(dataset_name, batch_size, device, flip_toy_var_order=False
     kwargs = {'num_workers': 1, 'pin_memory': True} if device.type is 'cuda' else {}
 
     train_loader = DataLoader(train_dataset, batch_size, shuffle=True, **kwargs)
+    val_loader = DataLoader(val_dataset, batch_size, shuffle=True, **kwargs)
     test_loader = DataLoader(test_dataset, batch_size, shuffle=False, **kwargs)
 
-    return train_loader, test_loader
+    return train_loader, val_loader, test_loader, permutation, inv_perm

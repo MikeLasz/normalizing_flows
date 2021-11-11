@@ -10,6 +10,14 @@ import torch.distributions as D
 import torchvision.transforms as T
 from torchvision.utils import save_image
 
+from nflows.utils import torchutils
+import numpy as np
+
+from torch.distributions.normal import Normal
+from torch.distributions.multivariate_normal import MultivariateNormal
+from pyro.distributions import MultivariateStudentT
+from torch.distributions.studentT import StudentT
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -21,6 +29,7 @@ import pprint
 import copy
 
 from data import fetch_dataloaders
+
 
 
 parser = argparse.ArgumentParser()
@@ -381,6 +390,88 @@ class MADEMOG(nn.Module):
         log_probs = torch.logsumexp(self.logr + self.base_dist.log_prob(u) + log_abs_det_jacobian, dim=1)  # sum over C; out (N, L)
         return log_probs.sum(1)  # sum over L; out (N,)
 
+class norm_tDist(nn.Module):
+    """A multivariate Distribution composed of marginal Gaussian and t Distributions with zero mean, unit scale, and learnable degree of freedom.
+        Important: tail_indexes must be sorted such that the first d indeces are 0, and the following are non-zero."""
+
+    def __init__(self, shape, tail_indexes):
+        super().__init__()
+        self._shape = torch.Size(shape)
+        self._d = self._shape[0]
+        self._tail_indexes = tail_indexes
+        self.num_light = tail_indexes[np.where(tail_indexes == 0)].size
+        self.num_heavy = self._d - self.num_light
+
+        self.register_buffer("_log_z_normcomp",
+                             torch.tensor(0.5 * np.prod(self.num_light) * np.log(2 * np.pi),
+                                          dtype=torch.float32),
+                             persistent=False)
+
+        tail_indexes = np.array(tail_indexes)
+
+        self.df = nn.Parameter(torch.tensor(tail_indexes[np.nonzero(tail_indexes)], dtype=torch.float, device=args.device))
+        print(self.df)
+        self.T_dist = MultivariateStudentT(self.df.to(args.device), torch.tensor([0.0]).to(args.device),
+                                           torch.tensor([[1.0]]).to(args.device))
+
+    def log_prob(self, inputs, context=None):
+        # Note: the context is ignored.
+        if inputs.shape[1:] != self._shape:
+            raise ValueError(
+                "Expected input of shape {}, got {}".format(
+                    self._shape, inputs.shape[1:]
+                )
+            )
+
+        result = torch.zeros([inputs.shape[0]]).to(args.device)
+
+        # normal-components:
+        inputs_norm = inputs[:, :self.num_light]
+        neg_energy = -0.5 * \
+                     torchutils.sum_except_batch(inputs_norm ** 2, num_batch_dims=1)
+        log_prob_normal = neg_energy - self._log_z_normcomp
+        # t-components
+        
+        batch_size = inputs.shape[0]
+        inputs_t = inputs[:, self.num_light:].reshape([batch_size, self.num_heavy, 1])
+        log_prob_t = torch.sum(self.T_dist.log_prob(inputs_t), axis=1)
+        return torch.add(log_prob_normal, log_prob_t).to(args.device)
+
+    def sample(self, num_samples, context):
+        counter_heavytail = 0
+        if context is None:
+            dim_wise_sample = []
+            for dim in range(self._d):
+                if self._tail_indexes[dim] == 0:
+                    samp = torch.tensor(
+                        Normal(torch.tensor([0.0]).to(args.device), torch.tensor([1.0]).to(args.device)).rsample([num_samples]),
+                        dtype=torch.float).to(args.device)
+                else:
+                    samp = torch.tensor(StudentT(torch.tensor([self.df[counter_heavytail]])).rsample([num_samples]),
+                                        dtype=torch.float).to(args.device)
+                    counter_heavytail += 1
+                dim_wise_sample.append(samp)
+                # instead of:
+                # dim_wise_sample.append(self.marginals[dim].sample([num_samples]))
+                # this bug occured every time when I sample from dist( float, float, float)
+                # instead I must define the dist as dist(torch.tensor(floar), etc)
+            return torch.transpose(torch.stack(dim_wise_sample, 1).view(self._d, -1), 0,
+                                   1)  # instead of torch.stack(dim_wise_sample, 1)
+        else:
+            context_size = context.shape[0]
+            dim_wise_sample = []
+            for dim in range(self._d):
+                if self._tail_indexes == 0:
+                    samp = torch.tensor(Normal(torch.tensor([0.0]), torch.tensor([1.0])).rsample([num_samples]),
+                                        dtype=torch.float)
+                else:
+                    samp = torch.tensor(StudentT(self.df[counter_heavytail].data.to(args.device)).rsample([num_samples]),
+                                        dtype=torch.float)
+                    counter_heavytail += 1
+                dim_wise_sample.append(samp)
+            samples = torch.stack(dim_wise_sample, 1)
+            return torchutils.split_leading_dim(samples, [context_size, num_samples])
+
 
 class MAF(nn.Module):
     def __init__(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size=None, activation='relu', input_order='sequential', batch_norm=True):
@@ -411,8 +502,27 @@ class MAF(nn.Module):
 
     def log_prob(self, x, y=None):
         u, sum_log_abs_det_jacobians = self.forward(x, y)
-        return torch.sum(self.base_dist.log_prob(u) + sum_log_abs_det_jacobians, dim=1)
+        return torch.sum(self.base_dist().log_prob(u) + sum_log_abs_det_jacobians, dim=1)
 
+class mTAF(MAF):
+    def __init__(self, n_blocks, input_size, hidden_size, n_hidden, tail_indices, permutation, cond_label_size=None, activation='relu', input_order='sequential', batch_norm=True):
+        super().__init__(n_blocks, input_size, hidden_size, n_hidden, cond_label_size=None, activation='relu', input_order='sequential', batch_norm=True)
+        # base distribution for calculation of log prob under the model
+        self.df = np.array(tail_indices) #torch.tensor(np.array(tail_indices), dtype=torch.float) ##nn.Parameter(torch.tensor(tail_indices[np.nonzero(tail_indices)], dtype=torch.float))
+
+    #@property
+    def base_dist(self):
+        return norm_tDist([args.input_dims], self.df)
+
+class TAF(MAF):
+    def __init__(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size=None, activation='relu', input_order='sequential', batch_norm=True):
+        super().__init__(n_blocks, input_size, hidden_size, n_hidden, cond_label_size=None, activation='relu', input_order='sequential', batch_norm=True)
+        # base distribution for calculation of log prob under the model
+        self.df = nn.Parameter(torch.tensor(50.0, dtype=torch.float32))
+
+    @property
+    def base_dist(self):
+        return D.StudentT(self.df, self.base_dist_mean, self.base_dist_var)
 
 class MAFMOG(nn.Module):
     """ MAF on mixture of gaussian MADE """
@@ -583,12 +693,13 @@ def generate(model, dataset_lam, args, step=None, n_row=10):
     filename = 'generated_samples' + (step != None)*'_epoch_{}'.format(step) + '.png'
     save_image(samples, os.path.join(args.output_dir, filename), nrow=n_row, normalize=True)
 
-def train_and_evaluate(model, train_loader, test_loader, optimizer, args):
+def train_and_evaluate(model, train_loader, val_loader, test_loader, optimizer, args):
+    es_counter = 0
     best_eval_logprob = float('-inf')
 
     for i in range(args.start_epoch, args.start_epoch + args.n_epochs):
         train(model, train_loader, optimizer, i, args)
-        eval_logprob, _ = evaluate(model, test_loader, i, args)
+        eval_logprob, _ = evaluate(model, val_loader, i, args)
 
         # save training checkpoint
         torch.save({'epoch': i,
@@ -605,12 +716,20 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, args):
                         'model_state': model.state_dict(),
                         'optimizer_state': optimizer.state_dict()},
                         os.path.join(args.output_dir, 'best_model_checkpoint.pt'))
+            es_counter = 0
+        else:
+            es_counter += 1
+            print(f"Early Stopping counter {es_counter}/{30}.")
+            if es_counter == 30:
+                break
 
         # plot sample
         if args.dataset == 'TOY':
             plot_sample_and_density(model, train_loader.dataset.base_dist, args, step=i)
         if args.dataset == 'MNIST':
             generate(model, train_loader.dataset.lam, args, step=i)
+    # final test performance
+    test_logprob, _ = evaluate(model, test_loader, None, args)
 
 # --------------------
 # Plot
@@ -674,7 +793,10 @@ def plot_sample_and_density(model, target_dist, args, ranges_density=[[-5,20],[-
 if __name__ == '__main__':
 
     args = parser.parse_args()
-
+    if args.dataset == "MINIBOONE":
+        args.input_dims = 43
+    else:
+        args.input_dims = 21
     # setup file ops
     if not os.path.isdir(args.output_dir):
         os.makedirs(args.output_dir)
@@ -686,10 +808,33 @@ if __name__ == '__main__':
 
     # load data
     if args.conditional: assert args.dataset in ['MNIST', 'CIFAR10'], 'Conditional inputs only available for labeled datasets MNIST and CIFAR10.'
-    train_dataloader, test_dataloader = fetch_dataloaders(args.dataset, args.batch_size, args.device, args.flip_toy_var_order)
+    if args.model == "mtaf":
+        # 1. Get the Marginals
+        heavy_tailed = []
+        dfs = []
+        for j in range(args.input_dims):
+            PATH_tailest = "data/marginals/" + args.dataset + "/tail_estimator" + str(
+                j + 1) + ".txt"
+            tail_index = np.loadtxt(PATH_tailest)
+
+            # set tail_index > 10 to light-tailed distribution
+            if tail_index > 10:
+                tail_index = 0
+            dfs.append(tail_index)
+            if tail_index == 0:
+                heavy_tailed.append(False)
+                print("{}th Marginal is detected as light-tailed.".format(j + 1))
+            else:
+                heavy_tailed.append(True)
+                print("{}th Marginal is detected as heavy-tailed with tail-index {}.".format(j + 1, tail_index))
+    else:
+        dfs = args.input_dims * [0]
+        heavy_tailed = args.input_dims * [False]
+    train_dataloader, val_dataloader, test_dataloader, permutation, inv_permutation = fetch_dataloaders(args.dataset, args.batch_size, args.device, heavy_tailed, args.flip_toy_var_order)
     args.input_size = train_dataloader.dataset.input_size
     args.input_dims = train_dataloader.dataset.input_dims
     args.cond_label_size = train_dataloader.dataset.label_size if args.conditional else None
+
 
     # model
     if args.model == 'made':
@@ -709,6 +854,12 @@ if __name__ == '__main__':
     elif args.model =='realnvp':
         model = RealNVP(args.n_blocks, args.input_size, args.hidden_size, args.n_hidden, args.cond_label_size,
                         batch_norm=not args.no_batch_norm)
+    elif args.model == "taf":
+        model = TAF(args.n_blocks, args.input_size, args.hidden_size, args.n_hidden, args.cond_label_size,
+                    args.activation_fn, args.input_order, batch_norm=not args.no_batch_norm)
+    elif args.model == "mtaf":
+        model = mTAF(args.n_blocks, args.input_size, args.hidden_size, args.n_hidden, dfs, args.cond_label_size,
+                    args.activation_fn, args.input_order, batch_norm=not args.no_batch_norm)
     else:
         raise ValueError('Unrecognized model.')
 
@@ -732,7 +883,7 @@ if __name__ == '__main__':
     print(model, file=open(args.results_file, 'a'))
 
     if args.train:
-        train_and_evaluate(model, train_dataloader, test_dataloader, optimizer, args)
+        train_and_evaluate(model, train_dataloader, val_dataloader, test_dataloader, optimizer, args)
 
     if args.evaluate:
         evaluate(model, test_dataloader, None, args)
